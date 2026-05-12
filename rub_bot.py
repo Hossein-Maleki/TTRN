@@ -1,11 +1,16 @@
 """
-rub_bot.py — ربات روبیکا: دریافت کد یونیک از کاربر و فوروارد فایل
-از rubpy.bot.BotClient استفاده می‌کنه (توکن ربات روبیکا)
+rub_bot.py — ربات روبیکا
+دریافت کد یونیک و ارسال فایل به کاربر
+
+نسخه اصلاح‌شده برای Bot API جدید روبیکا
 """
 
 import os
 import re
 import time
+import json
+import requests
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,211 +18,241 @@ load_dotenv()
 RUBIKA_BOT_TOKEN = os.getenv("RUBIKA_BOT_TOKEN", "").strip()
 
 if not RUBIKA_BOT_TOKEN:
-    raise RuntimeError("RUBIKA_BOT_TOKEN را در .env تنظیم کن")
+    raise RuntimeError("RUBIKA_BOT_TOKEN در .env تنظیم نشده")
 
 import db
 
-# ─── تلاش برای import BotClient از rubpy ─────────────────────────────────────
-try:
-    from rubpy.bot import BotClient, filters as bot_filters
-    _USE_BOTCLIENT = True
-    print("✅ rubpy BotClient لود شد.")
-except ImportError:
-    _USE_BOTCLIENT = False
-    print("⚠️  BotClient در نسخه rubpy موجود نیست. از polling دستی استفاده می‌شه.")
 
-# ─── ابزارها ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# تنظیمات
+# ─────────────────────────────────────────────────────────────
 
-CODE_RE = re.compile(r'^[A-Z0-9]{8}$')
+BASE_URL = f"https://botapi.rubika.ir/v3/{RUBIKA_BOT_TOKEN}"
 
+CODE_RE = re.compile(r"^[A-Z0-9]{8}$")
+
+REQUEST_TIMEOUT = 35
+
+
+# ─────────────────────────────────────────────────────────────
+# ابزارها
+# ─────────────────────────────────────────────────────────────
 
 def is_valid_code(text: str) -> bool:
     return bool(CODE_RE.match((text or "").strip().upper()))
 
 
+def send_message(chat_id: str, text: str):
+    """
+    ارسال پیام به کاربر روبیکا
+    """
+
+    url = f"{BASE_URL}/sendMessage"
+
+    payload = {
+        "object_guid": chat_id,
+        "text": text,
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        data = resp.json()
+
+        if data.get("status") != "OK":
+            print("[sendMessage ERROR]")
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+
+    except Exception as e:
+        print(f"[send_message] {e}")
+
+
 def handle_message(sender_id: str, chat_id: str, text: str) -> str:
     """
-    پردازش پیام ورودی — برمی‌گرداند متن پاسخ
-    sender_id: guid کاربر روبیکا (u0xxx)
-    chat_id:   chat_id ربات (b0xxx) برای پاسخ
-    text:      متن دریافتی
+    پردازش پیام دریافتی
     """
+
     text = (text or "").strip()
 
-    if text.startswith("/start"):
+    print(f"[MESSAGE] {sender_id} -> {text}")
+
+    # استارت
+    if text.lower().startswith("/start"):
         return (
-            "سلام! 👋\n\n"
-            "من ربات **Tele2Rub** هستم.\n\n"
-            "کد ۸ کاراکتری که از ربات تلگرام دریافت کردی رو اینجا بفرست "
-            "تا فایلت برات ارسال بشه.\n\n"
-            "مثال: `AB12CD34`"
+            "سلام 👋\n\n"
+            "به ربات انتقال فایل خوش اومدی.\n\n"
+            "کد ۸ کاراکتری که از ربات تلگرام گرفتی رو بفرست.\n\n"
+            "مثال:\n"
+            "`AB12CD34`"
         )
 
     code = text.upper()
 
+    # اعتبارسنجی کد
     if not is_valid_code(code):
         return (
-            "❓ لطفاً کد ۸ کاراکتری که از ربات تلگرام گرفتی رو بفرست.\n"
-            "مثال: `AB12CD34`"
+            "❌ کد نامعتبره.\n\n"
+            "لطفاً کد ۸ کاراکتری صحیح ارسال کن.\n\n"
+            "مثال:\n"
+            "`AB12CD34`"
         )
 
+    # جستجو در دیتابیس
     file_record = db.get_file_by_code(code)
+
     if not file_record:
         return (
-            "❌ کد `" + code + "` پیدا نشد.\n"
-            "مطمئن شو کد رو درست وارد کردی."
+            f"❌ کد `{code}` پیدا نشد.\n\n"
+            "مطمئن شو درست واردش کردی."
         )
 
+    # بررسی تحویل قبلی
     if file_record["delivered"]:
         return (
-            "⚠️ این فایل قبلاً تحویل داده شده.\n"
-            "اگر دریافت نکردی با پشتیبانی تماس بگیر."
+            "⚠️ این فایل قبلاً ارسال شده."
         )
 
     # ثبت در صف فوروارد
     db.push_forward(code, sender_id)
 
     return (
-        f"✅ درخواست دریافت شد!\n\n"
+        "✅ درخواست ثبت شد.\n\n"
         f"🎫 کد: `{code}`\n"
         f"📄 فایل: `{file_record['file_name']}`\n"
         f"📦 حجم: `{db.pretty_size(file_record['file_size'])}`\n\n"
-        f"⏳ فایل در حال آماده‌سازی است. چند لحظه صبر کن..."
+        "⏳ لطفاً چند لحظه صبر کن..."
     )
 
 
-# ─── اجرا با BotClient (rubpy) ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# دریافت آپدیت‌ها
+# ─────────────────────────────────────────────────────────────
 
-def run_with_botclient():
-    """اجرا با rubpy BotClient — ربات رسمی روبیکا"""
-    app = BotClient(RUBIKA_BOT_TOKEN)
+def get_updates(offset_id=None):
 
-    @app.on_update(bot_filters.private)
-    async def on_message(client, update):
-        try:
-            text      = getattr(update, "text", "") or ""
-            sender_id = getattr(update, "sender_id", "") or ""
-            chat_id   = getattr(update, "chat_id", "") or ""
+    url = f"{BASE_URL}/getUpdates"
 
-            if not sender_id or not chat_id:
-                return
+    payload = {
+        "limit": 10,
+    }
 
-            reply = handle_message(sender_id, chat_id, text)
-            await update.reply(reply)
-        except Exception as e:
-            print(f"[rub_bot] خطا در پردازش پیام: {e}")
-            try:
-                await update.reply("❌ خطای داخلی. دوباره امتحان کن.")
-            except Exception:
-                pass
+    if offset_id is not None:
+        payload["offset_id"] = offset_id
 
-    print("✅ ربات روبیکا در حال اجراست...")
-    app.run()
-
-
-# ─── اجرا با polling دستی (fallback) ─────────────────────────────────────────
-
-def run_with_polling():
-    """
-    اجرا با API مستقیم روبیکا — وقتی BotClient موجود نیست
-    از کتابخانه rubika_bot یا requests مستقیم استفاده می‌کنه
-    """
     try:
-        from rubika_bot import Bot
-        _rubika_bot_available = True
-    except ImportError:
-        _rubika_bot_available = False
+        resp = requests.post(
+            url,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
 
-    if _rubika_bot_available:
-        _run_rubika_bot_lib()
-    else:
-        _run_manual_polling()
+        data = resp.json()
 
+        if data.get("status") != "OK":
+            print("[getUpdates ERROR]")
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+            return []
 
-def _run_rubika_bot_lib():
-    """با کتابخانه rubika_bot اجرا می‌کنه"""
-    from rubika_bot import Bot
-    from rubika_bot.requests import send_message, set_webhook
+        return data.get("data", {}).get("updates", [])
 
-    bot = Bot(RUBIKA_BOT_TOKEN)
-
-    import threading
-    import requests as req_lib
-
-    print("✅ ربات روبیکا (rubika_bot lib) در حال اجراست...")
-
-    def poll():
-        offset = None
-        while True:
-            try:
-                url = f"https://messengerg2b1.iranlms.ir/v3/{RUBIKA_BOT_TOKEN}/getUpdates"
-                payload = {"limit": 10, "timeout": 30}
-                if offset:
-                    payload["offset"] = offset
-                resp = req_lib.post(url, json=payload, timeout=35)
-                data = resp.json()
-                updates = data.get("data", {}).get("updates", [])
-                for upd in updates:
-                    offset = upd.get("update_id", offset)
-                    msg = upd.get("inline_message") or upd.get("message", {})
-                    text      = msg.get("text", "") or ""
-                    sender_id = msg.get("sender_id", "") or ""
-                    chat_id   = msg.get("chat_id", "") or ""
-                    if not chat_id:
-                        continue
-                    reply = handle_message(sender_id, chat_id, text)
-                    send_message(token=RUBIKA_BOT_TOKEN, chat_id=chat_id, text=reply)
-            except Exception as e:
-                print(f"[rub_bot poll] {e}")
-                time.sleep(3)
-
-    poll()
+    except Exception as e:
+        print(f"[get_updates] {e}")
+        return []
 
 
-def _run_manual_polling():
-    """polling دستی با requests مستقیم"""
-    import requests as req_lib
+# ─────────────────────────────────────────────────────────────
+# اجرای اصلی
+# ─────────────────────────────────────────────────────────────
 
-    print("✅ ربات روبیکا (manual polling) در حال اجراست...")
-    offset = None
+def main():
 
-    def send_msg(chat_id: str, text: str):
-        try:
-            url = f"https://messengerg2b1.iranlms.ir/v3/{RUBIKA_BOT_TOKEN}/sendMessage"
-            req_lib.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
-        except Exception as e:
-            print(f"[rub_bot send] {e}")
+    print("✅ ربات روبیکا اجرا شد")
+
+    # تست توکن
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/getMe",
+            timeout=20,
+        )
+
+        print("[getMe]")
+        print(resp.text)
+
+    except Exception as e:
+        print(f"[getMe ERROR] {e}")
+
+    offset_id = None
 
     while True:
+
         try:
-            url     = f"https://messengerg2b1.iranlms.ir/v3/{RUBIKA_BOT_TOKEN}/getUpdates"
-            payload = {"limit": 10, "timeout": 30}
-            if offset:
-                payload["offset"] = offset
-            resp    = req_lib.post(url, json=payload, timeout=35)
-            data    = resp.json()
-            updates = data.get("data", {}).get("updates", [])
+
+            updates = get_updates(offset_id)
+
+            if not updates:
+                time.sleep(1)
+                continue
 
             for upd in updates:
-                offset = upd.get("update_id", offset)
-                msg       = upd.get("inline_message") or upd.get("message", {})
-                text      = msg.get("text", "") or ""
-                sender_id = msg.get("sender_id", "") or ""
-                chat_id   = msg.get("chat_id", "") or ""
-                if not chat_id:
-                    continue
-                reply = handle_message(sender_id, chat_id, text)
-                send_msg(chat_id, reply)
+
+                try:
+
+                    print(json.dumps(
+                        upd,
+                        ensure_ascii=False,
+                        indent=2
+                    ))
+
+                    update_id = upd.get("update_id")
+
+                    if update_id is not None:
+                        offset_id = update_id + 1
+
+                    # ساختار جدید روبیکا
+                    msg = upd.get("new_message", {})
+
+                    if not msg:
+                        continue
+
+                    text = msg.get("text", "") or ""
+
+                    sender_id = (
+                        msg.get("author_object_guid")
+                        or msg.get("sender_object_guid")
+                        or ""
+                    )
+
+                    chat_id = (
+                        msg.get("object_guid")
+                        or ""
+                    )
+
+                    if not chat_id:
+                        continue
+
+                    reply = handle_message(
+                        sender_id=sender_id,
+                        chat_id=chat_id,
+                        text=text,
+                    )
+
+                    send_message(chat_id, reply)
+
+                except Exception as e:
+                    print(f"[UPDATE ERROR] {e}")
 
         except Exception as e:
-            print(f"[rub_bot] {e}")
+
+            print(f"[MAIN LOOP ERROR] {e}")
+
             time.sleep(3)
 
 
-# ─── main ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if _USE_BOTCLIENT:
-        run_with_botclient()
-    else:
-        run_with_polling()
+    main()
