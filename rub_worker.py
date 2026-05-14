@@ -1,3 +1,7 @@
+"""
+rub_worker.py — ورکر روبیکا v2
+آپلود فایل، صف فوروارد، تسک‌های ربات روبیکا (لینک/جستجو/getpost)
+"""
 
 import os, re, json, time, threading, shutil, asyncio
 from pathlib import Path
