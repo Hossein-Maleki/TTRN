@@ -1,7 +1,3 @@
- """
-telebot.py — ربات تلگرام
-نسخه ۲.۱ — پروفایل کاربری، اشتراک، خرید، مدیریت ادمین، منوی inline
-"""
 
 import os, re, json, time, asyncio, shutil
 from pathlib import Path
