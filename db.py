@@ -24,14 +24,18 @@ PLANS = [
     {"key": "5g",  "name": "۵ گیگ",  "bytes": 5  * 1024**3, "amount": 100_000, "days": 30},
     {"key": "10g", "name": "۱۰ گیگ", "bytes": 10 * 1024**3, "amount": 290_000, "days": 30},
 ]
-
-
-def get_conn() -> sqlite3.Connection:
+def get_conn():
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=20)
-    conn.row_factory = sqlite3.Row
+
+    def dict_factory(cursor, row):
+        return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+
+    conn.row_factory = dict_factory
+
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=10000")
+
     return conn
 
 
