@@ -1,4 +1,4 @@
-"""
+ """
 telebot.py — ربات تلگرام
 نسخه ۲.۱ — پروفایل کاربری، اشتراک، خرید، مدیریت ادمین، منوی inline
 """
@@ -326,7 +326,7 @@ def account_text(user) -> str:
     has_paid  = db.has_active_paid_plan(user["telegram_id"])
     plan_lbl  = user["sub_plan"] if has_paid else "هدیه رایگان"
     exp_lbl   = db.pretty_time(user["sub_expires"]) if has_paid else "—"
-    safe_ico  = "🔒" if user("safe_mode") else "🔓"
+    safe_ico  = "🔒" if user.get("safe_mode") else "🔓"
     name = " ".join(filter(None, [user["first_name"], user["last_name"]])) or "—"
     un   = f"@{user['username']}" if user["username"] else "—"
     return (
@@ -851,8 +851,8 @@ async def text_handler(client: Client, message: Message):
         "chat_id":           message.chat.id,
         "telegram_user_id":  user.id,
         "status_message_id": status.id,
-        "safe_mode":         bool(u("safe_mode")),
-        "zip_password":      u("zip_password", ""),
+        "safe_mode":         bool(u.get("safe_mode")),
+        "zip_password":      u.get("zip_password", ""),
     }
     queue.push(task)
     await status.edit_text(
