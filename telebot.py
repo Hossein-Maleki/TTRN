@@ -322,7 +322,7 @@ def account_text(user) -> str:
     has_paid  = db.has_active_paid_plan(user["telegram_id"])
     plan_lbl  = user["sub_plan"] if has_paid else "هدیه رایگان"
     exp_lbl   = db.pretty_time(user["sub_expires"]) if has_paid else "—"
-    safe_ico  = "🔒" if user.get("safe_mode") else "🔓"
+    safe_ico  = "🔒" if user("safe_mode") else "🔓"
     name = " ".join(filter(None, [user["first_name"], user["last_name"]])) or "—"
     un   = f"@{user['username']}" if user["username"] else "—"
     return (
@@ -340,7 +340,7 @@ def account_text(user) -> str:
         f"• باقی‌مانده: {pretty_size(remaining)}\n"
         f"`{bar}` `{pct:.1f}%`\n\n"
         f"📊 کل آپلود: {pretty_size(user['total_bytes'])}\n"
-        f"{safe_ico} Safe Mode: {'فعال' if user.get('safe_mode') else 'غیرفعال'}"
+        f"{safe_ico} Safe Mode: {'فعال' if user('safe_mode') else 'غیرفعال'}"
     )
 
 
