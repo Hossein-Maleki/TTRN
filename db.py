@@ -518,7 +518,26 @@ def get_stats() -> dict:
             "total_bytes":    total_bytes,
         }
 
+def remaining_quota_text(telegram_id: int) -> str:
+    user = get_user(telegram_id)
 
+    if not user:
+        return "نامشخص"
+
+    total = user["bytes_quota"] or 0
+    used = user["bytes_used"] or 0
+    remaining = max(0, total - used)
+
+    percent = int((used / total) * 100) if total else 0
+
+    plan = "💎 اشتراک فعال" if has_active_paid_plan(telegram_id) else "🎁 رایگان"
+
+    return (
+        f"{plan}\n"
+        f"📦 مصرف شده: {pretty_size(used)}\n"
+        f"💾 باقی‌مانده: {pretty_size(remaining)}\n"
+        f"📊 {percent}% استفاده شده"
+    )
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ابزارهای نمایش
 # ═══════════════════════════════════════════════════════════════════════════════
