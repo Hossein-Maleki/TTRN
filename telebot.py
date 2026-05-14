@@ -1,6 +1,6 @@
 """
 telebot.py — ربات تلگرام
-نسخه ۲.۰ — پروفایل کاربری، اشتراک، خرید، مدیریت ادمین، منوی inline
+نسخه ۲.۱ — پروفایل کاربری، اشتراک، خرید، مدیریت ادمین، منوی inline
 """
 
 import os, re, json, time, asyncio, shutil
@@ -319,7 +319,7 @@ def help_text() -> str:
     ) + "\n".join(f"• {db.pretty_size(p['bytes'])} — {p['amount']:,} تومان".replace(",","،") for p in db.PLANS)
 
 
-def account_text(user: db.sqlite3.Row) -> str:
+def account_text(user) -> str:
     remaining = max(0, user["bytes_quota"] - user["bytes_used"])
     pct       = min(100, user["bytes_used"] * 100 / max(user["bytes_quota"], 1))
     bar       = progress_bar(pct, 16)
@@ -373,7 +373,7 @@ def payment_text(plan: dict, tx_code: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  هندلرهای Callback (inline buttons)
+#  هندلرهای Callback
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.on_callback_query()
@@ -621,37 +621,6 @@ async def orders_handler(client: Client, message: Message):
     await message.reply_text("\n".join(lines))
 
 
-@app.on_message(filters.private & filters.command("order"))
-async def order_detail_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/order ID`")
-        return
-    order = db.get_order(order_id=int(parts[1]))
-    if not order:
-        await message.reply_text("❌ سفارش پیدا نشد.")
-        return
-    await message.reply_text(
-        f"📋 **جزئیات سفارش #{order['id']}**\n\n"
-        f"کاربر: `{order['telegram_id']}`\n"
-        f"پلن: {order['plan_name']}\n"
-        f"مبلغ: {order['amount']:,} تومان\n"
-        f"کد: `{order['tx_code']}`\n"
-        f"وضعیت: {order['status']}\n"
-        f"تاریخ: {db.pretty_time(order['created_at'])}\n"
-        f"رسید: {'✅ دارد' if order['receipt_file_id'] else '❌ ندارد'}\n"
-        f"یادداشت: {order['admin_note'] or '—'}"
-    )
-    if order["receipt_file_id"]:
-        try:
-            await client.send_photo(message.chat.id, order["receipt_file_id"],
-                                    caption=f"رسید سفارش #{order['id']}")
-        except Exception:
-            pass
-
-
 @app.on_message(filters.private & filters.command("approve"))
 async def approve_handler(client: Client, message: Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -690,41 +659,6 @@ async def approve_handler(client: Client, message: Message):
         await message.reply_text("❌ تأیید ناموفق (شاید قبلاً بررسی شده).")
 
 
-@app.on_message(filters.private & filters.command("reject"))
-async def reject_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/reject ORDER_ID [علت]`")
-        return
-    try:
-        order_id = int(parts[1])
-        note = parts[2] if len(parts) > 2 else ""
-    except ValueError:
-        await message.reply_text("فرمت نادرست.")
-        return
-
-    order = db.get_order(order_id=order_id)
-    if not order:
-        await message.reply_text("❌ سفارش پیدا نشد.")
-        return
-    if db.reject_order(order_id, note):
-        await message.reply_text(f"❌ سفارش #{order_id} رد شد.")
-        try:
-            await client.send_message(
-                order["telegram_id"],
-                f"⛔ سفارش شما رد شد.\n\n"
-                f"📋 پلن: {order['plan_name']}\n"
-                f"علت: {note or 'بدون توضیح'}\n\n"
-                f"برای سفارش مجدد: /buy",
-            )
-        except Exception:
-            pass
-    else:
-        await message.reply_text("❌ عملیات ناموفق.")
-
-
 @app.on_message(filters.private & filters.command("stats"))
 async def stats_handler(client: Client, message: Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -745,87 +679,6 @@ async def stats_handler(client: Client, message: Message):
         f"• سفارش‌های معلق: {s['pending_orders']:,}\n\n"
         f"🔔 برای مشاهده سفارش‌ها: `/orders`"
     )
-
-
-@app.on_message(filters.private & filters.command("users"))
-async def users_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    users = db.get_all_users(20)
-    lines = [f"👥 **لیست کاربران** (آخرین ۲۰)\n"]
-    for u in users:
-        icon = "✅" if db.has_active_paid_plan(u["telegram_id"]) else "🎁"
-        name = u["first_name"] or "بدون نام"
-        remaining = max(0, u["bytes_quota"] - u["bytes_used"])
-        lines.append(f"{icon} `{u['telegram_id']}` — {name} | باقی: {pretty_size(remaining)}")
-    await message.reply_text("\n".join(lines))
-
-
-@app.on_message(filters.private & filters.command("addsub"))
-async def addsub_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.reply_text("استفاده: `/addsub USER_ID DAYS`")
-        return
-    try:
-        uid, days = int(parts[1]), int(parts[2])
-    except ValueError:
-        await message.reply_text("فرمت نادرست.")
-        return
-    expires = time.time() + days * 86400
-    extra   = days * 1024**3  # ۱ گیگ در روز (قابل تنظیم)
-    db.set_subscription(uid, True, expires, "ادمین", extra)
-    await message.reply_text(f"✅ اشتراک {days} روزه برای `{uid}` فعال شد.")
-
-
-@app.on_message(filters.private & filters.command("delsub"))
-async def delsub_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/delsub USER_ID`")
-        return
-    db.set_subscription(int(parts[1]), False)
-    await message.reply_text(f"❌ اشتراک `{parts[1]}` غیرفعال شد.")
-
-
-@app.on_message(filters.private & filters.command("setcard"))
-async def setcard_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/setcard شماره_کارت`")
-        return
-    db.set_setting("card_number", parts[1].strip())
-    await message.reply_text(f"✅ شماره کارت ذخیره شد: `{parts[1].strip()}`")
-
-
-@app.on_message(filters.private & filters.command("setholder"))
-async def setholder_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/setholder نام دارنده کارت`")
-        return
-    db.set_setting("card_holder", parts[1].strip())
-    await message.reply_text(f"✅ نام دارنده کارت ذخیره شد: {parts[1].strip()}")
-
-
-@app.on_message(filters.private & filters.command("setsupport"))
-async def setsupport_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/setsupport @username`")
-        return
-    db.set_setting("support_username", parts[1].strip())
-    await message.reply_text(f"✅ پشتیبانی تنظیم شد: {parts[1].strip()}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1062,7 +915,7 @@ async def media_handler(client: Client, message: Message):
             await status.edit_text(reason2)
             return
 
-        archive_path = DOWNLOAD_DIR / "archive" if False else ARCHIVE_DIR / download_name
+        archive_path = ARCHIVE_DIR / download_name
         shutil.copy2(str(dl_path), str(archive_path))
 
         unique_code = db.create_file_record(

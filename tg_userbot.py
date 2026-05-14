@@ -124,7 +124,8 @@ class TelegramUserbot:
         try:
             chat = await app.join_chat(invite_hash)
             db.save_channel_access(str(chat.id))
-            db.save_channel_access(chat.username or str(chat.id))
+            if chat.username:
+                db.save_channel_access(chat.username)
             return chat.title or str(chat.id)
         except UserAlreadyParticipant:
             return "قبلاً عضو بودید"

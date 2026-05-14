@@ -1,5 +1,5 @@
 """
-rub_bot.py — ربات روبیکا (فیکس‌شده)
+rub_bot.py — ربات روبیکا (رفع‌شده)
 دریافت کد یونیک از کاربر، جستجو در دیتابیس، فوروارد فایل
 
 اصلاحات:
@@ -204,7 +204,7 @@ def handle_message(sender_id: str, chat_id: str, text: str) -> str:
 # روش ۱ — rubpy BotClient (اصلی)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _extract_update_fields(update) -> tuple[str, str, str]:
+def _extract_update_fields(update) -> tuple:
     """
     استخراج sender_id، chat_id، text از آبجکت update ربات‌های روبیکا.
     rubpy ممکن است ساختارهای مختلفی داشته باشد؛ اینجا همه را چک می‌کنیم.
@@ -303,7 +303,7 @@ _API_BASES = [
 ]
 
 
-def _api_call(method: str, payload: dict, timeout: int = 35) -> dict | None:
+def _api_call(method: str, payload: dict, timeout: int = 35) -> dict:
     """فراخوانی API روبیکا با تلاش روی چند endpoint"""
     import requests
 

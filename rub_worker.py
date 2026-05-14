@@ -1,5 +1,5 @@
 """
-rub_worker.py — ورکر روبیکا v2
+rub_worker.py — ورکر روبیکا v2 - رفع‌شده
 آپلود فایل، صف فوروارد، تسک‌های ربات روبیکا (لینک/جستجو/getpost)
 """
 
@@ -453,7 +453,10 @@ def process_rubika_tasks():
 
         task_id  = task_row["id"]
         ttype    = task_row["task_type"]
-        data     = json.loads(task_row["task_data"] or "{}")
+        try:
+            data     = json.loads(task_row["task_data"] or "{}")
+        except:
+            data = {}
         rubika_uid = task_row["rubika_user_id"]
         chat_id  = data.get("chat_id", rubika_uid)
 

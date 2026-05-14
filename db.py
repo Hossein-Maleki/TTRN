@@ -1,6 +1,6 @@
 """
 db.py — مدیریت دیتابیس SQLite برای پروژه Tele2Rub
-نسخه ۲.۰ — با پشتیبانی از اشتراک، سفارش، آمار و صف‌های توسعه‌یافته
+نسخه ۲.۱ — با پشتیبانی از اشتراک، سفارش، آمار، صف‌های توسعه‌یافته و تسک‌های ربات روبیکا
 """
 
 import sqlite3
@@ -123,11 +123,28 @@ def init_db():
                 PRIMARY KEY (rubika_user_id, channel_id)
             );
 
+            CREATE TABLE IF NOT EXISTS rubika_tasks (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                rubika_user_id  TEXT    NOT NULL,
+                task_type       TEXT    NOT NULL,
+                task_data       TEXT    NOT NULL,
+                status          TEXT    DEFAULT 'pending',
+                error           TEXT,
+                created_at      REAL    NOT NULL,
+                updated_at      REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_access (
+                channel_id TEXT PRIMARY KEY,
+                accessed_at REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_files_code    ON files(unique_code);
             CREATE INDEX IF NOT EXISTS idx_fwd_status    ON forward_queue(status);
             CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_fetch_status  ON tg_fetch_queue(status);
             CREATE INDEX IF NOT EXISTS idx_orders_tid    ON orders(telegram_id);
+            CREATE INDEX IF NOT EXISTS idx_rubika_tasks_status ON rubika_tasks(status);
         """)
         defaults = [
             ("card_number",    "6037-XXXX-XXXX-XXXX"),
@@ -160,6 +177,34 @@ def _migrate():
             conn.execute("ALTER TABLE forward_queue ADD COLUMN text_content TEXT")
         if "forward_type" not in fwd_cols:
             conn.execute("ALTER TABLE forward_queue ADD COLUMN forward_type TEXT DEFAULT 'file'")
+
+        # جداول جدید
+        try:
+            conn.execute("SELECT 1 FROM rubika_tasks LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("""
+                CREATE TABLE rubika_tasks (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rubika_user_id  TEXT    NOT NULL,
+                    task_type       TEXT    NOT NULL,
+                    task_data       TEXT    NOT NULL,
+                    status          TEXT    DEFAULT 'pending',
+                    error           TEXT,
+                    created_at      REAL    NOT NULL,
+                    updated_at      REAL
+                )
+            """)
+            conn.execute("CREATE INDEX idx_rubika_tasks_status ON rubika_tasks(status)")
+
+        try:
+            conn.execute("SELECT 1 FROM channel_access LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("""
+                CREATE TABLE channel_access (
+                    channel_id TEXT PRIMARY KEY,
+                    accessed_at REAL NOT NULL
+                )
+            """)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -438,7 +483,68 @@ def fail_forward(fwd_id: int, error: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  صف فچ تلگرام (یوزربات)
+#  صف تسک‌های ربات روبیکا (لینک/جستجو/getpost)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def push_rubika_task(rubika_user_id: str, task_type: str, task_data: dict) -> int:
+    """اضافه کردن تسک برای ربات روبیکا"""
+    import json
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "INSERT INTO rubika_tasks (rubika_user_id,task_type,task_data,created_at) VALUES (?,?,?,?)",
+            (rubika_user_id, task_type, json.dumps(task_data, ensure_ascii=False), time.time()),
+        )
+        return cursor.lastrowid
+
+
+def pop_rubika_task() -> Optional[sqlite3.Row]:
+    """دریافت اولین تسک pending"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM rubika_tasks WHERE status='pending' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row:
+            conn.execute("UPDATE rubika_tasks SET status='processing' WHERE id=?", (row["id"],))
+        return row
+
+
+def complete_rubika_task(task_id: int):
+    """تسک را به done تبدیل کن"""
+    with get_conn() as conn:
+        conn.execute("UPDATE rubika_tasks SET status='done', updated_at=? WHERE id=?", (time.time(), task_id))
+
+
+def fail_rubika_task(task_id: int, error: str):
+    """تسک را ناموفق علامت‌گذاری کن"""
+    with get_conn() as conn:
+        conn.execute("UPDATE rubika_tasks SET status='failed', error=?, updated_at=? WHERE id=?", (error, time.time(), task_id))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  دسترسی به کانال‌های خصوصی
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def save_channel_access(channel_id: str):
+    """ذخیره دسترسی به کانال خصوصی"""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_access (channel_id, accessed_at) VALUES (?, ?)",
+            (str(channel_id), time.time()),
+        )
+
+
+def has_channel_access(channel_id: str) -> bool:
+    """بررسی دسترسی به کانال"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM channel_access WHERE channel_id=?",
+            (str(channel_id),),
+        ).fetchone()
+    return row is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  صف فچ تلگرام (یوزربات) - برای سازگاری
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def push_tg_fetch(rubika_user_id: str, request_type: str,
