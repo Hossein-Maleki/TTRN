@@ -1,6 +1,6 @@
 """
-telebot.py — ربات تلگرام
-نسخه ۲.۰ — پروفایل کاربری، اشتراک، خرید، مدیریت ادمین، منوی inline
+telebot.py — ربات تلگرام Tele2Rub v2
+پروفایل، اشتراک، خرید، پنل ادمین، انتقال فایل
 """
 
 import os, re, json, time, asyncio, shutil
@@ -32,6 +32,7 @@ QUEUE_FILE   = QUEUE_DIR / "tasks.jsonl"
 STATUS_FILE  = QUEUE_DIR / "status.jsonl"
 CANCEL_FILE  = QUEUE_DIR / "cancelled.jsonl"
 DELETED_FILE = QUEUE_DIR / "deleted.jsonl"
+SETTINGS_FILE = QUEUE_DIR / "settings.json"
 
 for d in [DOWNLOAD_DIR, ARCHIVE_DIR, QUEUE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -41,17 +42,12 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
 
 app = Client("tel2rub", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# حالت در حال انتظار رسید پرداخت {user_id: order_id}
-awaiting_receipt: dict = {}
-# حالت در حال انتظار رمز ZIP {user_id: True}
-awaiting_zip_pass: dict = {}
-# حالت ادمین منتظر توکن کارت / شماره کارت {user_id: field_name}
-awaiting_admin_input: dict = {}
+# وضعیت موقت کاربران در حافظه
+user_state: dict = {}          # {user_id: {"step": str, ...}}
+waiting_for_zip_password: dict = {}   # {chat_id: True}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ابزارها
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────── ابزارها ─────────────────────────────────────
 
 def safe_filename(name: Optional[str]) -> str:
     name = (name or "file.bin").strip()
@@ -60,39 +56,46 @@ def safe_filename(name: Optional[str]) -> str:
     return name[:200] or "file.bin"
 
 
-def get_media(message: Message):
-    for attr in ["document","video","audio","voice","photo","animation","video_note","sticker"]:
-        m = getattr(message, attr, None)
-        if m:
-            return attr, m
-    return None, None
-
-
 def build_filename(message: Message, media_type: str, media) -> str:
     original = getattr(media, "file_name", None)
     if not original:
         uid = getattr(media, "file_unique_id", None) or "file"
-        ext = {"document":".bin","video":".mp4","audio":".mp3","voice":".ogg",
-               "photo":".jpg","animation":".mp4","video_note":".mp4","sticker":".webp"}.get(media_type, ".bin")
+        ext = {"document": ".bin", "video": ".mp4", "audio": ".mp3",
+               "voice": ".ogg", "photo": ".jpg", "animation": ".mp4",
+               "video_note": ".mp4", "sticker": ".webp"}.get(media_type, ".bin")
         original = f"{uid}{ext}"
     original = safe_filename(original)
     p = Path(original)
     return safe_filename(f"{p.stem}_{message.id}{p.suffix or '.bin'}")
 
 
-def pretty_size(s) -> str:
-    return db.pretty_size(s)
+def get_media(message: Message):
+    for attr in ["document", "video", "audio", "voice", "photo",
+                 "animation", "video_note", "sticker"]:
+        m = getattr(message, attr, None)
+        if m:
+            return attr, m
+    return None, None
 
 
-def progress_bar(pct: float, n=14) -> str:
-    f = int(n * pct / 100)
-    return "█" * f + "░" * (n - f)
+def pretty_size(size) -> str:
+    size = float(size or 0)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} TB"
 
 
-def eta_text(s) -> str:
-    if not s or s <= 0:
+def progress_bar(percent: float, length: int = 12) -> str:
+    filled = int(length * percent / 100)
+    return "█" * filled + "░" * (length - filled)
+
+
+def eta_text(seconds) -> str:
+    if not seconds or seconds <= 0:
         return "نامشخص"
-    s = int(s)
+    s = int(seconds)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     if h:   return f"{h}h {m}m"
@@ -100,46 +103,20 @@ def eta_text(s) -> str:
     return f"{s}s"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  کیبورد‌های inline
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 حساب من", callback_data="account"),
-         InlineKeyboardButton("💳 خرید اشتراک", callback_data="buy")],
-        [InlineKeyboardButton("📖 راهنما", callback_data="help"),
-         InlineKeyboardButton("💬 پشتیبانی", callback_data="support")],
-        [InlineKeyboardButton("🔒 Safe Mode", callback_data="safemode_info")],
-    ])
+def load_settings() -> dict:
+    try:
+        if SETTINGS_FILE.exists():
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"safe_mode": False, "zip_password": ""}
 
 
-def plans_kb() -> InlineKeyboardMarkup:
-    rows = []
-    for plan in db.PLANS:
-        amt = f"{plan['amount']:,}".replace(",", "،")
-        label = f"{plan['name']}  |  {amt} تومان"
-        rows.append([InlineKeyboardButton(label, callback_data=f"plan_{plan['key']}")])
-    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")])
-    return InlineKeyboardMarkup(rows)
+def save_settings(data: dict):
+    SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def confirm_plan_kb(plan_key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ تأیید و پرداخت", callback_data=f"confirm_{plan_key}"),
-         InlineKeyboardButton("❌ انصراف", callback_data="buy")],
-    ])
-
-
-def cancel_order_kb(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ لغو سفارش", callback_data=f"cancel_order_{order_id}")],
-    ])
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  صف
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────── صف ──────────────────────────────────────────
 
 class QueueManager:
     def __init__(self):
@@ -197,16 +174,131 @@ def was_deleted(job_id=None, message_id=None) -> bool:
         return False
     with open(DELETED_FILE, encoding="utf-8") as f:
         for line in f:
-            if not line.strip(): continue
+            if not line.strip():
+                continue
             item = json.loads(line)
-            if job_id and str(item.get("job_id")) == str(job_id): return True
-            if message_id and int(item.get("status_message_id", 0)) == message_id: return True
+            if job_id and str(item.get("job_id")) == str(job_id):
+                return True
+            if message_id and int(item.get("status_message_id", 0)) == message_id:
+                return True
     return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  پیشرفت دانلود
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────── کیبوردها ────────────────────────────────────
+
+def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📊 حساب من",       callback_data="menu_account"),
+         InlineKeyboardButton("💎 خرید اشتراک",   callback_data="menu_buy")],
+        [InlineKeyboardButton("📖 راهنما",         callback_data="menu_help"),
+         InlineKeyboardButton("🔒 Safe Mode",      callback_data="menu_safemode")],
+    ]
+    if user_id in ADMIN_IDS:
+        rows.append([InlineKeyboardButton("👑 پنل ادمین", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def plans_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for p in db.PLANS:
+        label = f"{p['name']} — {p['price']:,} تومن / {p['days']} روز"
+        rows.append([InlineKeyboardButton(label, callback_data=f"buy_plan_{p['id']}")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_panel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 سفارش‌های در انتظار", callback_data="admin_pending"),
+         InlineKeyboardButton("📊 آمار فروش",           callback_data="admin_stats")],
+        [InlineKeyboardButton("👥 کاربران",             callback_data="admin_users"),
+         InlineKeyboardButton("💳 تنظیم کارت",          callback_data="admin_card")],
+        [InlineKeyboardButton("🔙 بازگشت",              callback_data="menu_back")],
+    ])
+
+
+def order_action_kb(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تایید",  callback_data=f"admin_confirm_{order_id}"),
+        InlineKeyboardButton("❌ رد",     callback_data=f"admin_reject_{order_id}"),
+    ]])
+
+
+def safemode_kb(is_on: bool) -> InlineKeyboardMarkup:
+    if is_on:
+        btn = InlineKeyboardButton("🔓 غیرفعال کردن", callback_data="safemode_off")
+    else:
+        btn = InlineKeyboardButton("🔒 فعال کردن",    callback_data="safemode_on")
+    return InlineKeyboardMarkup([
+        [btn],
+        [InlineKeyboardButton("🔙 بازگشت",            callback_data="menu_back")],
+    ])
+
+
+# ─────────────────────────────── متن‌های ثابت ────────────────────────────────
+
+HELP_TEXT = (
+    "📖 **راهنمای ربات Tele2Rub**\n\n"
+    "**روش انتقال فایل:**\n"
+    "1️⃣ فایل را در تلگرام برای ربات بفرست\n"
+    "2️⃣ کد ۸ کاراکتری دریافت کن\n"
+    "3️⃣ کد را در **ربات روبیکا** بفرست تا فایل برات بیاد\n\n"
+    "**لینک پست تلگرام در روبیکا:**\n"
+    "لینک عمومی: `https://t.me/channel/123`\n"
+    "لینک خصوصی: ابتدا لینک جوین، بعد لینک پست\n\n"
+    "**جستجو در کانال (در ربات روبیکا):**\n"
+    "`/search @channel کلمه`\n\n"
+    "**دریافت پست خاص (در ربات روبیکا):**\n"
+    "`/getpost @channel 1234`\n\n"
+    "**دستورات:**\n"
+    "`/del JOB_ID` — حذف از صف\n"
+    "`/delall` — پاکسازی کل صف\n\n"
+    "**تست رایگان:** ۲۰۰ مگابایت هدیه برای هر کاربر جدید 🎁\n"
+    "**فایل‌های پشتیبانی‌شده:** سند، ویدیو، موزیک، ویس، عکس، گیف"
+)
+
+
+def account_text(user_id: int) -> str:
+    user = db.get_user(user_id)
+    if not user:
+        return "پروفایل یافت نشد. لطفاً /start بزن."
+    sub   = "✅ فعال" if user["sub_active"] else "❌ ندارد"
+    exp   = db.pretty_time(user["sub_expires"]) if user["sub_expires"] else "بدون محدودیت زمانی"
+    name  = " ".join(filter(None, [user["first_name"], user["last_name"]])) or "—"
+    un    = f"@{user['username']}" if user["username"] else "—"
+    return (
+        f"👤 **پروفایل کاربر**\n\n"
+        f"🆔 آیدی: `{user['telegram_id']}`\n"
+        f"📛 نام: {name}\n"
+        f"🔗 یوزرنیم: {un}\n"
+        f"📅 عضویت: {db.pretty_time(user['joined_at'])}\n\n"
+        f"📦 **مصرف کل:** `{db.pretty_size(user['total_bytes'])}`\n\n"
+        f"📊 **سهمیه دوره جاری:**\n"
+        f"{db.remaining_quota_text(user)}\n\n"
+        f"🔑 اشتراک: {sub}\n"
+        f"⏳ انقضا: {exp}"
+    )
+
+
+def payment_info_text(plan: dict, tx_code: str) -> str:
+    ps = db.get_payment_settings()
+    return (
+        f"💎 **سفارش اشتراک {plan['name']}**\n\n"
+        f"📦 حجم: `{db.pretty_size(plan['size_bytes'])}`\n"
+        f"📅 مدت: `{plan['days']} روز`\n"
+        f"💰 مبلغ: `{plan['price']:,} تومن`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💳 **شماره کارت:**\n`{ps['card_number']}`\n\n"
+        f"👤 **صاحب کارت:** {ps['card_holder']}\n"
+        f"🏦 **بانک:** {ps['bank_name']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔑 **کد یونیک تراکنش:**\n`{tx_code}`\n\n"
+        f"⚠️ **مهم:** کد یونیک را در توضیحات پرداخت وارد کنید\n\n"
+        f"📸 بعد از پرداخت، **رسید** را اینجا بفرست."
+    )
+
+
+# ────────────────────────── هندلر دانلود ─────────────────────────────────────
 
 async def download_progress(current, total, status_msg, file_name, started_at, state):
     now = time.time()
@@ -221,8 +313,10 @@ async def download_progress(current, total, status_msg, file_name, started_at, s
         f"📥 **دریافت از تلگرام**\n\n"
         f"فایل: `{file_name}`\n"
         f"حجم: `{pretty_size(total)}`\n"
-        f"`{progress_bar(percent)}` `{percent:.1f}%`\n"
-        f"سرعت: `{pretty_size(speed)}/s` | مانده: `{eta_text(eta)}`"
+        f"پیشرفت: `{percent:.1f}%`\n"
+        f"`{progress_bar(percent)}`\n"
+        f"سرعت: `{pretty_size(speed)}/s`\n"
+        f"زمان باقی‌مانده: `{eta_text(eta)}`"
     )
     try:
         await status_msg.edit_text(text)
@@ -230,9 +324,7 @@ async def download_progress(current, total, status_msg, file_name, started_at, s
         pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ناظر وضعیت (از rub_worker)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────── ناظر وضعیت ──────────────────────────────────────
 
 async def status_watcher():
     pos = 0
@@ -246,15 +338,17 @@ async def status_watcher():
                 lines = f.readlines()
                 pos = f.tell()
             for line in lines:
-                if not line.strip(): continue
-                data = json.loads(line)
+                if not line.strip():
+                    continue
+                data    = json.loads(line)
                 chat_id = data.get("chat_id")
                 msg_id  = data.get("message_id")
                 text    = data.get("text", "")
-                pct     = data.get("percent")
-                if not chat_id or not msg_id: continue
-                if pct is not None:
-                    text += f"\n\n`{progress_bar(float(pct))}` `{float(pct):.1f}%`"
+                percent = data.get("percent")
+                if not chat_id or not msg_id:
+                    continue
+                if percent is not None:
+                    text += f"\n\n`{progress_bar(float(percent))}` `{float(percent):.1f}%`"
                 try:
                     await app.edit_message_text(chat_id, msg_id, text)
                 except Exception:
@@ -263,604 +357,382 @@ async def status_watcher():
             pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  متن‌های ثابت
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def welcome_text(first_name: str) -> str:
-    return (
-        f"سلام **{first_name}** 👋\n\n"
-        "به ربات **Tele2Rub** خوش اومدی!\n\n"
-        "🚀 **امکانات:**\n"
-        "• انتقال فایل از تلگرام به روبیکا\n"
-        "• دریافت پست‌های عمومی و خصوصی\n"
-        "• جستجو و دریافت پست از کانال‌های تلگرام\n"
-        "• دریافت آخرین پست‌های کانال\n"
-        "• پشتیبانی از عکس، ویدیو، موزیک، ویس، گیف و فایل\n"
-        "• تست رایگان تا ۲۰ مگابایت\n"
-        "• هدیه ۲۰۰ مگابایت برای همه کاربران جدید 🎁\n\n"
-        "📋 **دستورات سریع:**\n"
-        "`/account` — حساب و آمار مصرف\n"
-        "`/buy` — خرید اشتراک\n"
-        "`/safemode on` — رمزگذاری ZIP\n"
-        "`/del [id]` — حذف از صف\n\n"
-        "از منوی پایین استفاده کن 👇"
-    )
-
-
-def help_text() -> str:
-    return (
-        "📖 **راهنمای کامل ربات**\n\n"
-        "**ارسال فایل:**\n"
-        "فایل، ویدیو، عکس، صدا یا هر مدیا رو برای ربات بفرست.\n"
-        "ربات آپلود می‌کنه و کد ۸ رقمی بهت می‌ده.\n\n"
-        "**دریافت در روبیکا:**\n"
-        "کد ۸ رقمی رو در ربات روبیکا وارد کن.\n\n"
-        "**لینک تلگرام:**\n"
-        "در ربات روبیکا لینک پست ارسال کن:\n"
-        "`https://t.me/channel/1234`\n\n"
-        "**کانال خصوصی:**\n"
-        "اول لینک دعوت را بفرست:\n"
-        "`https://t.me/+invite_code`\n"
-        "سپس لینک پست:\n"
-        "`https://t.me/c/123456/55`\n\n"
-        "**جستجو در کانال:**\n"
-        "`/search @channel کلمه`\n\n"
-        "**گرفتن پست مشخص:**\n"
-        "`/getpost @channel 1234`\n\n"
-        "**آخرین پست‌ها:**\n"
-        "`/latest @channel`\n\n"
-        "**Safe Mode:**\n"
-        "فایل رو ZIP رمزدار می‌کنه:\n"
-        "`/safemode on` → رمز رو بفرست\n"
-        "`/safemode off` → غیرفعال\n\n"
-        "**پلن‌های اشتراک:**\n"
-        "هر پلن ۳۰ روزه است:\n"
-    ) + "\n".join(f"• {db.pretty_size(p['bytes'])} — {p['amount']:,} تومان".replace(",","،") for p in db.PLANS)
-
-
-def account_text(user: db.sqlite3.Row) -> str:
-    remaining = max(0, user["bytes_quota"] - user["bytes_used"])
-    pct       = min(100, user["bytes_used"] * 100 / max(user["bytes_quota"], 1))
-    bar       = progress_bar(pct, 16)
-    has_paid  = db.has_active_paid_plan(user["telegram_id"])
-    plan_lbl  = user["sub_plan"] if has_paid else "هدیه رایگان"
-    exp_lbl   = db.pretty_time(user["sub_expires"]) if has_paid else "—"
-    safe_ico  = "🔒" if user.get("safe_mode") else "🔓"
-    name = " ".join(filter(None, [user["first_name"], user["last_name"]])) or "—"
-    un   = f"@{user['username']}" if user["username"] else "—"
-    return (
-        f"👤 **حساب من**\n\n"
-        f"🆔 آیدی: `{user['telegram_id']}`\n"
-        f"📛 نام: {name}\n"
-        f"🔗 یوزرنیم: {un}\n"
-        f"📅 عضویت: {db.pretty_time(user['joined_at'])}\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"📦 **مصرف سهمیه**\n"
-        f"• پلن فعال: {plan_lbl}\n"
-        f"• انقضا: {exp_lbl}\n"
-        f"• سهمیه کل: {pretty_size(user['bytes_quota'])}\n"
-        f"• مصرف شده: {pretty_size(user['bytes_used'])}\n"
-        f"• باقی‌مانده: {pretty_size(remaining)}\n"
-        f"`{bar}` `{pct:.1f}%`\n\n"
-        f"📊 کل آپلود: {pretty_size(user['total_bytes'])}\n"
-        f"{safe_ico} Safe Mode: {'فعال' if user.get('safe_mode') else 'غیرفعال'}"
-    )
-
-
-def payment_text(plan: dict, tx_code: str) -> str:
-    amt = f"{plan['amount']:,}".replace(",", "،")
-    sz  = pretty_size(plan["bytes"])
-    card = db.get_setting("card_number", "—")
-    holder = db.get_setting("card_holder", "—")
-    return (
-        f"💳 **اطلاعات پرداخت**\n\n"
-        f"📋 پلن: **{plan['name']} — {sz}**\n"
-        f"💰 مبلغ: **{amt} تومان**\n"
-        f"⏳ اعتبار: {plan['days']} روز\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"🏦 شماره کارت:\n`{card}`\n"
-        f"👤 نام دارنده: {holder}\n\n"
-        f"🎫 **کد پیگیری تراکنش:**\n"
-        f"`{tx_code}`\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"⚠️ **مراحل پرداخت:**\n"
-        f"۱. مبلغ را به شماره کارت بالا واریز کن\n"
-        f"۲. کد پیگیری را در توضیحات انتقال وارد کن\n"
-        f"۳. تصویر رسید را همین‌جا برای ربات بفرست\n\n"
-        f"🔔 بعد از تأیید ادمین، اشتراک فعال می‌شه."
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  هندلرهای Callback (inline buttons)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.on_callback_query()
-async def on_callback(client: Client, query: CallbackQuery):
-    data    = query.data
-    user    = query.from_user
-    user_id = user.id
-    db.upsert_user(user_id, user.username or "", user.first_name or "", user.last_name or "")
-
-    await query.answer()
-
-    # ─── بازگشت به منوی اصلی ─────────────────────────────────────────────────
-    if data == "back_main":
-        await query.message.edit_text(
-            welcome_text(user.first_name),
-            reply_markup=main_menu_kb()
-        )
-
-    # ─── حساب من ─────────────────────────────────────────────────────────────
-    elif data == "account":
-        u = db.get_user(user_id)
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💳 خرید اشتراک", callback_data="buy"),
-            InlineKeyboardButton("🔙 بازگشت", callback_data="back_main"),
-        ]])
-        await query.message.edit_text(account_text(u), reply_markup=kb)
-
-    # ─── خرید اشتراک ─────────────────────────────────────────────────────────
-    elif data == "buy":
-        pending = db.get_user_pending_order(user_id)
-        if pending:
-            await query.message.edit_text(
-                f"⚠️ یه سفارش در انتظار داری:\n\n"
-                f"پلن: **{pending['plan_name']}**\n"
-                f"کد: `{pending['tx_code']}`\n\n"
-                f"رسید رو ارسال کن یا سفارش رو لغو کن.",
-                reply_markup=cancel_order_kb(pending["id"]),
-            )
-            awaiting_receipt[user_id] = pending["id"]
-            return
-
-        await query.message.edit_text(
-            "💳 **خرید اشتراک**\n\n"
-            "یکی از پلن‌های زیر رو انتخاب کن:\n"
-            "همه پلن‌ها ۳۰ روزه هستند و بعد از تأیید رسید فعال می‌شن.",
-            reply_markup=plans_kb(),
-        )
-
-    # ─── انتخاب پلن ──────────────────────────────────────────────────────────
-    elif data.startswith("plan_"):
-        plan_key = data[5:]
-        plan = next((p for p in db.PLANS if p["key"] == plan_key), None)
-        if not plan:
-            return
-        amt = f"{plan['amount']:,}".replace(",", "،")
-        sz  = pretty_size(plan["bytes"])
-        await query.message.edit_text(
-            f"📋 **تأیید سفارش**\n\n"
-            f"پلن: **{plan['name']} ({sz})**\n"
-            f"مبلغ: **{amt} تومان**\n"
-            f"مدت: {plan['days']} روز\n\n"
-            f"آیا مطمئنی؟",
-            reply_markup=confirm_plan_kb(plan_key),
-        )
-
-    # ─── تأیید و ساخت سفارش ──────────────────────────────────────────────────
-    elif data.startswith("confirm_"):
-        plan_key = data[8:]
-        plan = next((p for p in db.PLANS if p["key"] == plan_key), None)
-        if not plan:
-            return
-        try:
-            tx_code = db.create_order(user_id, plan)
-        except Exception as e:
-            await query.message.edit_text(f"❌ خطا در ثبت سفارش: {e}")
-            return
-
-        awaiting_receipt[user_id] = db.get_user_pending_order(user_id)["id"]
-        await query.message.edit_text(
-            payment_text(plan, tx_code),
-            reply_markup=cancel_order_kb(awaiting_receipt[user_id]),
-        )
-
-    # ─── لغو سفارش ────────────────────────────────────────────────────────────
-    elif data.startswith("cancel_order_"):
-        order_id = int(data[13:])
-        db.reject_order(order_id, "لغو توسط کاربر")
-        awaiting_receipt.pop(user_id, None)
-        await query.message.edit_text(
-            "❌ سفارش لغو شد.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💳 خرید مجدد", callback_data="buy"),
-                InlineKeyboardButton("🔙 منو اصلی", callback_data="back_main"),
-            ]]),
-        )
-
-    # ─── راهنما ───────────────────────────────────────────────────────────────
-    elif data == "help":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")]])
-        await query.message.edit_text(help_text(), reply_markup=kb)
-
-    # ─── پشتیبانی ─────────────────────────────────────────────────────────────
-    elif data == "support":
-        sup = db.get_setting("support_username", "@admin")
-        kb  = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="back_main")]])
-        await query.message.edit_text(
-            f"💬 **پشتیبانی**\n\n"
-            f"برای ارتباط با پشتیبانی:\n{sup}",
-            reply_markup=kb,
-        )
-
-    # ─── اطلاعات Safe Mode ───────────────────────────────────────────────────
-    elif data == "safemode_info":
-        u = db.get_user(user_id)
-        status = "فعال 🔒" if u.get("safe_mode") else "غیرفعال 🔓"
-        await query.message.edit_text(
-            f"🔒 **Safe Mode**\n\n"
-            f"وضعیت فعلی: {status}\n\n"
-            f"با فعال بودن این حالت، فایل‌ها به صورت ZIP رمزدار ارسال می‌شن.\n\n"
-            f"برای فعال‌سازی: `/safemode on`\n"
-            f"برای غیرفعال: `/safemode off`",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 بازگشت", callback_data="back_main"),
-            ]]),
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  دستورات کاربر
-# ═══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────── دستورات اصلی ────────────────────────────────────
 
 @app.on_message(filters.private & filters.command("start"))
-async def start_handler(client: Client, message: Message):
+async def start_handler(_, message: Message):
     user = message.from_user
     db.upsert_user(user.id, user.username or "", user.first_name or "", user.last_name or "")
-    await message.reply_text(welcome_text(user.first_name), reply_markup=main_menu_kb())
-
-
-@app.on_message(filters.private & filters.command("account"))
-async def account_handler(client: Client, message: Message):
-    db.upsert_user(message.from_user.id, message.from_user.username or "",
-                   message.from_user.first_name or "", message.from_user.last_name or "")
-    u = db.get_user(message.from_user.id)
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💳 خرید اشتراک", callback_data="buy"),
-        InlineKeyboardButton("🏠 منوی اصلی", callback_data="back_main"),
-    ]])
-    await message.reply_text(account_text(u), reply_markup=kb)
+    await message.reply_text(
+        f"سلام **{user.first_name}** 👋\n\n"
+        "به ربات **Tele2Rub** خوش اومدی!\n\n"
+        "📌 **امکانات:**\n"
+        "• انتقال فایل از تلگرام به روبیکا\n"
+        "• دریافت پست‌های عمومی و خصوصی تلگرام در روبیکا\n"
+        "• جستجو داخل کانال‌ها\n"
+        "• تست رایگان تا **۲۰۰ مگابایت** 🎁\n"
+        "• پشتیبانی از عکس، ویدیو، موزیک، ویس، گیف و فایل\n\n"
+        "از منوی زیر استفاده کن 👇",
+        reply_markup=main_menu_kb(user.id),
+    )
 
 
 @app.on_message(filters.private & filters.command("profile"))
-async def profile_handler(client: Client, message: Message):
-    await account_handler(client, message)
-
-
-@app.on_message(filters.private & filters.command("buy"))
-async def buy_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    db.upsert_user(user_id, message.from_user.username or "",
+async def profile_cmd(_, message: Message):
+    db.upsert_user(message.from_user.id, message.from_user.username or "",
                    message.from_user.first_name or "", message.from_user.last_name or "")
-    pending = db.get_user_pending_order(user_id)
-    if pending:
-        awaiting_receipt[user_id] = pending["id"]
-        await message.reply_text(
-            f"⚠️ سفارش قبلی در انتظار:\n\nپلن: **{pending['plan_name']}**\nکد: `{pending['tx_code']}`\n\nرسید پرداخت را بفرست.",
-            reply_markup=cancel_order_kb(pending["id"]),
-        )
-        return
-    await message.reply_text(
-        "💳 **خرید اشتراک** — پلن مورد نظر را انتخاب کن:",
-        reply_markup=plans_kb(),
-    )
+    await message.reply_text(account_text(message.from_user.id))
 
 
 @app.on_message(filters.private & filters.command("sub"))
-async def sub_handler(client: Client, message: Message):
-    u = db.get_user(message.from_user.id)
-    if not u:
+async def sub_cmd(_, message: Message):
+    user_row = db.get_user(message.from_user.id)
+    if not user_row:
         await message.reply_text("ابتدا /start بزن.")
         return
-    has_paid = db.has_active_paid_plan(message.from_user.id)
-    remaining = max(0, u["bytes_quota"] - u["bytes_used"])
-    if has_paid:
-        await message.reply_text(
-            f"✅ پلن فعال: **{u['sub_plan']}**\n"
-            f"⏳ انقضا: `{db.pretty_time(u['sub_expires'])}`\n"
-            f"📦 باقی‌مانده: `{pretty_size(remaining)}`"
-        )
+    if user_row["sub_active"]:
+        exp = db.pretty_time(user_row["sub_expires"]) if user_row["sub_expires"] else "بدون محدودیت"
+        await message.reply_text(f"✅ اشتراک شما فعال است.\n⏳ انقضا: `{exp}`")
     else:
-        await message.reply_text(
-            f"📦 هدیه رایگان: `{pretty_size(remaining)}` باقی‌مانده\n\n"
-            f"برای خرید اشتراک: /buy",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💳 خرید اشتراک", callback_data="buy"),
-            ]]),
+        await message.reply_text("❌ اشتراک فعالی ندارید.\n\nبرای خرید از منوی ربات استفاده کنید.")
+
+
+# ─────────────────────────── callback queries ────────────────────────────────
+
+@app.on_callback_query()
+async def callback_handler(_, cq: CallbackQuery):
+    data    = cq.data
+    user    = cq.from_user
+    user_id = user.id
+
+    db.upsert_user(user_id, user.username or "", user.first_name or "", user.last_name or "")
+
+    # ── بازگشت به منو اصلی
+    if data == "menu_back":
+        await cq.edit_message_text(
+            f"منوی اصلی — {user.first_name} 👋",
+            reply_markup=main_menu_kb(user_id),
         )
 
-
-@app.on_message(filters.private & filters.command("safemode"))
-async def safemode_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.reply_text("استفاده: `/safemode on` یا `/safemode off`")
-        return
-    action = args[1].strip().lower()
-    if action == "on":
-        awaiting_zip_pass[user_id] = True
-        await message.reply_text("🔒 Safe Mode فعال شد.\n\nرمز ZIP مورد نظرت رو بفرست:")
-    elif action == "off":
-        db.update_safe_mode(user_id, False)
-        awaiting_zip_pass.pop(user_id, None)
-        await message.reply_text("🔓 Safe Mode غیرفعال شد.")
-    else:
-        await message.reply_text("دستور نادرست. استفاده: `/safemode on` یا `/safemode off`")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  دستورات ادمین
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.on_message(filters.private & filters.command("orders"))
-async def orders_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split()
-    status = parts[1] if len(parts) > 1 else "pending"
-    if status not in ("pending", "approved", "rejected", "all"):
-        status = "pending"
-    orders = db.get_orders_by_status(None if status == "all" else status, limit=15)
-    if not orders:
-        await message.reply_text(f"📋 هیچ سفارشی با وضعیت `{status}` وجود ندارد.")
-        return
-    lines = [f"📋 **سفارش‌ها — {status}** ({len(orders)} مورد)\n"]
-    for o in orders:
-        icon = {"pending": "🟡", "approved": "✅", "rejected": "❌"}.get(o["status"], "⚪")
-        name = o["first_name"] or str(o["telegram_id"])
-        receipt = "✅" if o["receipt_file_id"] else "❌"
-        lines.append(
-            f"{icon} **#{o['id']}** | {name} (`{o['telegram_id']}`)\n"
-            f"   پلن: {o['plan_name']} | {o['amount']:,} تومان | رسید: {receipt}\n"
-            f"   کد: `{o['tx_code']}` | تاریخ: {db.pretty_time(o['created_at'])}\n"
-            f"   `/approve {o['id']}` | `/reject {o['id']} علت`\n"
+    # ── حساب من
+    elif data == "menu_account":
+        await cq.edit_message_text(
+            account_text(user_id),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 خرید اشتراک", callback_data="menu_buy")],
+                [InlineKeyboardButton("🔙 بازگشت",      callback_data="menu_back")],
+            ]),
         )
-    await message.reply_text("\n".join(lines))
 
+    # ── خرید اشتراک (انتخاب پلن)
+    elif data == "menu_buy":
+        text = (
+            "💎 **خرید اشتراک**\n\n"
+            "یکی از پلن‌های زیر را انتخاب کن:\n\n"
+        )
+        for p in db.PLANS:
+            text += f"• **{p['name']}** — {p['price']:,} تومن / {p['days']} روز\n"
+        await cq.edit_message_text(text, reply_markup=plans_kb())
 
-@app.on_message(filters.private & filters.command("order"))
-async def order_detail_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/order ID`")
-        return
-    order = db.get_order(order_id=int(parts[1]))
-    if not order:
-        await message.reply_text("❌ سفارش پیدا نشد.")
-        return
-    await message.reply_text(
-        f"📋 **جزئیات سفارش #{order['id']}**\n\n"
-        f"کاربر: `{order['telegram_id']}`\n"
-        f"پلن: {order['plan_name']}\n"
-        f"مبلغ: {order['amount']:,} تومان\n"
-        f"کد: `{order['tx_code']}`\n"
-        f"وضعیت: {order['status']}\n"
-        f"تاریخ: {db.pretty_time(order['created_at'])}\n"
-        f"رسید: {'✅ دارد' if order['receipt_file_id'] else '❌ ندارد'}\n"
-        f"یادداشت: {order['admin_note'] or '—'}"
-    )
-    if order["receipt_file_id"]:
-        try:
-            await client.send_photo(message.chat.id, order["receipt_file_id"],
-                                    caption=f"رسید سفارش #{order['id']}")
-        except Exception:
-            pass
+    # ── انتخاب پلن خاص
+    elif data.startswith("buy_plan_"):
+        plan_id = int(data.split("_")[-1])
+        plan    = next((p for p in db.PLANS if p["id"] == plan_id), None)
+        if not plan:
+            await cq.answer("پلن نامعتبر.", show_alert=True)
+            return
+        result = db.create_order(user_id, plan_id)
+        user_state[user_id] = {
+            "step":     "waiting_receipt",
+            "order_id": result["order_id"],
+            "tx_code":  result["tx_code"],
+            "plan":     plan,
+        }
+        await cq.edit_message_text(
+            payment_info_text(plan, result["tx_code"]),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ انصراف", callback_data="cancel_order")]
+            ]),
+        )
 
+    # ── انصراف از سفارش
+    elif data == "cancel_order":
+        user_state.pop(user_id, None)
+        await cq.edit_message_text(
+            "سفارش لغو شد.",
+            reply_markup=main_menu_kb(user_id),
+        )
 
-@app.on_message(filters.private & filters.command("approve"))
-async def approve_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/approve ORDER_ID [یادداشت]`")
-        return
-    try:
-        order_id = int(parts[1])
-        note = parts[2] if len(parts) > 2 else ""
-    except ValueError:
-        await message.reply_text("فرمت نادرست.")
-        return
+    # ── راهنما
+    elif data == "menu_help":
+        await cq.edit_message_text(
+            HELP_TEXT,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_back")]
+            ]),
+        )
 
-    order = db.get_order(order_id=order_id)
-    if not order:
-        await message.reply_text("❌ سفارش پیدا نشد.")
-        return
-    if db.approve_order(order_id, note):
-        await message.reply_text(f"✅ سفارش #{order_id} تأیید شد و اشتراک فعال گردید.")
-        # اطلاع‌رسانی به کاربر
-        try:
-            u = db.get_user(order["telegram_id"])
-            await client.send_message(
-                order["telegram_id"],
-                f"🎉 **اشتراک شما فعال شد!**\n\n"
-                f"📋 پلن: **{order['plan_name']}**\n"
-                f"📦 سهمیه: {pretty_size(order['plan_bytes'])}\n"
-                f"⏳ انقضا: {db.pretty_time(u['sub_expires'])}\n\n"
-                f"✨ از ربات لذت ببر!",
+    # ── safe mode
+    elif data == "menu_safemode":
+        settings = load_settings()
+        is_on    = settings.get("safe_mode", False)
+        status   = "🔒 فعال" if is_on else "🔓 غیرفعال"
+        await cq.edit_message_text(
+            f"**Safe Mode** — {status}\n\n"
+            "وقتی فعال باشد، فایل‌ها با رمز ZIP ارسال می‌شوند.",
+            reply_markup=safemode_kb(is_on),
+        )
+
+    elif data == "safemode_on":
+        settings = load_settings()
+        settings["safe_mode"] = True
+        save_settings(settings)
+        waiting_for_zip_password[cq.message.chat.id] = True
+        await cq.edit_message_text(
+            "🔒 Safe Mode فعال شد.\n\nحالا رمز ZIP مورد نظرت رو بفرست:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ انصراف", callback_data="safemode_off")]
+            ]),
+        )
+
+    elif data == "safemode_off":
+        settings = load_settings()
+        settings["safe_mode"] = False
+        settings["zip_password"] = ""
+        save_settings(settings)
+        waiting_for_zip_password.pop(cq.message.chat.id, None)
+        await cq.edit_message_text(
+            "🔓 Safe Mode غیرفعال شد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="menu_back")]
+            ]),
+        )
+
+    # ── پنل ادمین
+    elif data == "admin_panel":
+        if user_id not in ADMIN_IDS:
+            await cq.answer("دسترسی ندارید.", show_alert=True)
+            return
+        await cq.edit_message_text("👑 **پنل مدیریت**", reply_markup=admin_panel_kb())
+
+    elif data == "admin_pending":
+        if user_id not in ADMIN_IDS:
+            return
+        orders = db.get_pending_orders()
+        if not orders:
+            await cq.answer("سفارش در انتظاری وجود ندارد.", show_alert=True)
+            return
+        for o in orders:
+            u = db.get_user(o["telegram_user_id"])
+            name = (u["first_name"] if u else "") or str(o["telegram_user_id"])
+            text = (
+                f"📋 **سفارش #{o['id']}**\n\n"
+                f"👤 کاربر: {name} (`{o['telegram_user_id']}`)\n"
+                f"💎 پلن: {o['plan_name']}\n"
+                f"💰 مبلغ: {o['amount']:,} تومن\n"
+                f"🔑 کد تراکنش: `{o['tx_code']}`\n"
+                f"📅 تاریخ: {db.pretty_time(o['created_at'])}\n"
             )
-        except Exception:
-            pass
-    else:
-        await message.reply_text("❌ تأیید ناموفق (شاید قبلاً بررسی شده).")
+            if o["receipt_file_id"]:
+                try:
+                    await app.send_photo(
+                        user_id, o["receipt_file_id"],
+                        caption=text,
+                        reply_markup=order_action_kb(o["id"]),
+                    )
+                except Exception:
+                    await app.send_message(
+                        user_id, text + "\n⚠️ رسید موجود نیست.",
+                        reply_markup=order_action_kb(o["id"]),
+                    )
+            else:
+                await app.send_message(
+                    user_id, text + "\n⚠️ رسید ارسال نشده.",
+                    reply_markup=order_action_kb(o["id"]),
+                )
+        await cq.answer()
+
+    elif data == "admin_stats":
+        if user_id not in ADMIN_IDS:
+            return
+        stats  = db.get_orders_stats()
+        n_users = db.count_users()
+        text = (
+            f"📊 **آمار کلی**\n\n"
+            f"👥 کل کاربران: `{n_users}`\n\n"
+            f"🛒 **سفارش‌ها:**\n"
+            f"• کل: `{stats['total']}`\n"
+            f"• تایید شده: `{stats['confirmed']}`\n"
+            f"• در انتظار: `{stats['pending']}`\n\n"
+            f"💰 **درآمد تایید شده:** `{stats['revenue']:,} تومن`"
+        )
+        recent = db.get_recent_orders(10)
+        if recent:
+            text += "\n\n**۱۰ سفارش اخیر:**\n"
+            status_fa = {"pending": "⏳", "confirmed": "✅", "rejected": "❌"}
+            for o in recent:
+                ico = status_fa.get(o["status"], "❓")
+                text += f"{ico} #{o['id']} — {o['plan_name']} — {o['amount']:,}ت — {db.pretty_time(o['created_at'])}\n"
+        await cq.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel")]
+            ]),
+        )
+
+    elif data == "admin_users":
+        if user_id not in ADMIN_IDS:
+            return
+        users  = db.get_all_users(limit=15)
+        n_tot  = db.count_users()
+        text   = f"👥 **کاربران ({n_tot} نفر) — ۱۵ آخر:**\n\n"
+        for u in users:
+            sub = "✅" if u["sub_active"] else "❌"
+            name = (u["first_name"] or "")[:15] or str(u["telegram_id"])
+            text += f"{sub} `{u['telegram_id']}` — {name} — {db.pretty_size(u['total_bytes'])}\n"
+        await cq.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_panel")]
+            ]),
+        )
+
+    elif data == "admin_card":
+        if user_id not in ADMIN_IDS:
+            return
+        ps = db.get_payment_settings()
+        user_state[user_id] = {"step": "admin_edit_card"}
+        await cq.edit_message_text(
+            f"💳 **اطلاعات فعلی کارت:**\n\n"
+            f"شماره: `{ps['card_number']}`\n"
+            f"صاحب: {ps['card_holder']}\n"
+            f"بانک: {ps['bank_name']}\n\n"
+            f"فرمت ارسال:\n`شماره کارت|نام صاحب|نام بانک`\n\n"
+            f"مثال:\n`6037-9975-1234-5678|علی احمدی|ملی`",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ انصراف", callback_data="admin_panel")]
+            ]),
+        )
+
+    elif data.startswith("admin_confirm_"):
+        if user_id not in ADMIN_IDS:
+            return
+        order_id = int(data.split("_")[-1])
+        order    = db.confirm_order(order_id)
+        if order:
+            await cq.edit_message_reply_markup(reply_markup=None)
+            await cq.message.reply_text(f"✅ سفارش #{order_id} تایید شد.")
+            try:
+                await app.send_message(
+                    order["telegram_user_id"],
+                    f"✅ **پرداخت شما تایید شد!**\n\n"
+                    f"💎 پلن: {order['plan_name']}\n"
+                    f"📦 حجم: {db.pretty_size(order['plan_size_bytes'])}\n"
+                    f"📅 مدت: ۳۰ روز\n\n"
+                    f"اشتراک شما فعال شد. از ربات لذت ببرید! 🎉"
+                )
+            except Exception:
+                pass
+
+    elif data.startswith("admin_reject_"):
+        if user_id not in ADMIN_IDS:
+            return
+        order_id = int(data.split("_")[-1])
+        order    = db.reject_order(order_id)
+        if order:
+            await cq.edit_message_reply_markup(reply_markup=None)
+            await cq.message.reply_text(f"❌ سفارش #{order_id} رد شد.")
+            try:
+                await app.send_message(
+                    order["telegram_user_id"],
+                    f"❌ **پرداخت شما رد شد.**\n\n"
+                    f"اگر مشکلی وجود دارد با ادمین تماس بگیرید."
+                )
+            except Exception:
+                pass
+
+    await cq.answer()
 
 
-@app.on_message(filters.private & filters.command("reject"))
-async def reject_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/reject ORDER_ID [علت]`")
-        return
-    try:
-        order_id = int(parts[1])
-        note = parts[2] if len(parts) > 2 else ""
-    except ValueError:
-        await message.reply_text("فرمت نادرست.")
-        return
-
-    order = db.get_order(order_id=order_id)
-    if not order:
-        await message.reply_text("❌ سفارش پیدا نشد.")
-        return
-    if db.reject_order(order_id, note):
-        await message.reply_text(f"❌ سفارش #{order_id} رد شد.")
-        try:
-            await client.send_message(
-                order["telegram_id"],
-                f"⛔ سفارش شما رد شد.\n\n"
-                f"📋 پلن: {order['plan_name']}\n"
-                f"علت: {note or 'بدون توضیح'}\n\n"
-                f"برای سفارش مجدد: /buy",
-            )
-        except Exception:
-            pass
-    else:
-        await message.reply_text("❌ عملیات ناموفق.")
-
-
-@app.on_message(filters.private & filters.command("stats"))
-async def stats_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    s = db.get_stats()
-    await message.reply_text(
-        f"📊 **آمار کامل ربات**\n\n"
-        f"👥 کاربران: {s['total_users']:,}\n"
-        f"✅ اشتراک فعال: {s['active_subs']:,}\n"
-        f"📁 فایل‌های آپلودشده: {s['total_files']:,}\n"
-        f"✅ تحویل‌داده‌شده: {s['delivered']:,}\n"
-        f"📦 کل انتقال: {pretty_size(s['total_bytes'])}\n\n"
-        f"━━━━━━━━━━━━━━━━\n"
-        f"💰 **فروش**\n"
-        f"• سفارش‌های تأییدشده: {s['approved_count']:,}\n"
-        f"• درآمد کل: {s['total_revenue']:,} تومان\n"
-        f"• درآمد امروز: {s['today_revenue']:,} تومان\n"
-        f"• سفارش‌های معلق: {s['pending_orders']:,}\n\n"
-        f"🔔 برای مشاهده سفارش‌ها: `/orders`"
-    )
-
-
-@app.on_message(filters.private & filters.command("users"))
-async def users_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    users = db.get_all_users(20)
-    lines = [f"👥 **لیست کاربران** (آخرین ۲۰)\n"]
-    for u in users:
-        icon = "✅" if db.has_active_paid_plan(u["telegram_id"]) else "🎁"
-        name = u["first_name"] or "بدون نام"
-        remaining = max(0, u["bytes_quota"] - u["bytes_used"])
-        lines.append(f"{icon} `{u['telegram_id']}` — {name} | باقی: {pretty_size(remaining)}")
-    await message.reply_text("\n".join(lines))
-
+# ─────────────────────────── دستورات ادمین ──────────────────────────────────
 
 @app.on_message(filters.private & filters.command("addsub"))
-async def addsub_handler(client: Client, message: Message):
+async def addsub_handler(_, message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     parts = message.text.split()
     if len(parts) < 3:
-        await message.reply_text("استفاده: `/addsub USER_ID DAYS`")
+        await message.reply_text("استفاده: `/addsub USER_ID DAYS [GB]`\nمثال: `/addsub 123456 30 5`")
         return
     try:
-        uid, days = int(parts[1]), int(parts[2])
+        uid   = int(parts[1])
+        days  = int(parts[2])
+        gb    = float(parts[3]) if len(parts) > 3 else 5
     except ValueError:
         await message.reply_text("فرمت نادرست.")
         return
+    quota   = int(gb * 1024**3)
     expires = time.time() + days * 86400
-    extra   = days * 1024**3  # ۱ گیگ در روز (قابل تنظیم)
-    db.set_subscription(uid, True, expires, "ادمین", extra)
-    await message.reply_text(f"✅ اشتراک {days} روزه برای `{uid}` فعال شد.")
+    db.set_subscription(uid, True, expires, quota)
+    await message.reply_text(
+        f"✅ اشتراک `{gb}` گیگ / {days} روز برای `{uid}` فعال شد."
+    )
 
 
 @app.on_message(filters.private & filters.command("delsub"))
-async def delsub_handler(client: Client, message: Message):
+async def delsub_handler(_, message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
     parts = message.text.split()
     if len(parts) < 2:
         await message.reply_text("استفاده: `/delsub USER_ID`")
         return
-    db.set_subscription(int(parts[1]), False)
-    await message.reply_text(f"❌ اشتراک `{parts[1]}` غیرفعال شد.")
+    uid = int(parts[1])
+    db.set_subscription(uid, False)
+    await message.reply_text(f"❌ اشتراک کاربر `{uid}` غیرفعال شد.")
 
 
-@app.on_message(filters.private & filters.command("setcard"))
-async def setcard_handler(client: Client, message: Message):
+@app.on_message(filters.private & filters.command("admin"))
+async def admin_cmd(_, message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/setcard شماره_کارت`")
-        return
-    db.set_setting("card_number", parts[1].strip())
-    await message.reply_text(f"✅ شماره کارت ذخیره شد: `{parts[1].strip()}`")
+    await message.reply_text("👑 **پنل مدیریت**", reply_markup=admin_panel_kb())
 
 
-@app.on_message(filters.private & filters.command("setholder"))
-async def setholder_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/setholder نام دارنده کارت`")
-        return
-    db.set_setting("card_holder", parts[1].strip())
-    await message.reply_text(f"✅ نام دارنده کارت ذخیره شد: {parts[1].strip()}")
-
-
-@app.on_message(filters.private & filters.command("setsupport"))
-async def setsupport_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text("استفاده: `/setsupport @username`")
-        return
-    db.set_setting("support_username", parts[1].strip())
-    await message.reply_text(f"✅ پشتیبانی تنظیم شد: {parts[1].strip()}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  حذف از صف
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────── حذف از صف ──────────────────────────────────────
 
 @app.on_message(filters.private & filters.command("delall"))
-async def clear_queue_handler(client: Client, message: Message):
+async def clear_queue_handler(client, message: Message):
     tasks = queue.all()
     if not tasks:
         await message.reply_text("صف خالی است.")
         return
     for task in tasks:
         mark_deleted(task)
-        for path_key in ("archive_path", "path"):
-            old = task.get(path_key)
-            if old:
-                try: Path(old).unlink(missing_ok=True)
-                except Exception: pass
+        old = task.get("archive_path") or task.get("path")
+        if old:
+            try:
+                Path(old).unlink(missing_ok=True)
+            except Exception:
+                pass
         try:
-            await client.edit_message_text(task["chat_id"], task["status_message_id"], "این مورد از صف حذف شد.")
+            await client.edit_message_text(
+                task["chat_id"], task["status_message_id"], "این مورد از صف حذف شد."
+            )
         except Exception:
             pass
     with open(QUEUE_FILE, "w", encoding="utf-8") as f:
         pass
     queue._cache = None
     queue._mtime = 0
-    await message.reply_text("✅ کل صف پاک شد.")
+    await message.reply_text("✅ تمام موارد صف پاک شد.")
 
 
 @app.on_message(filters.private & filters.command("del"))
-async def delete_one_handler(client: Client, message: Message):
-    parts = message.text.split(maxsplit=1)
-    job_id = parts[1].strip() if len(parts) > 1 else None
-    reply_msg_id = message.reply_to_message.id if message.reply_to_message else None
+async def delete_one_handler(client, message: Message):
+    parts    = message.text.split(maxsplit=1)
+    job_id   = parts[1].strip() if len(parts) > 1 else None
+    reply_id = message.reply_to_message.id if message.reply_to_message else None
 
     tasks = queue.all()
     if not tasks:
@@ -871,19 +743,22 @@ async def delete_one_handler(client: Client, message: Message):
             cancel_job(job_id)
             await message.reply_text("لغو ثبت شد.")
         else:
-            await message.reply_text("صف خالی است.")
+            await message.reply_text("موردی در صف نیست.")
         return
 
-    removed = queue.remove(job_id=job_id, message_id=reply_msg_id)
+    removed = queue.remove(job_id=job_id, message_id=reply_id)
     if removed:
         mark_deleted(removed)
-        for pk in ("archive_path", "path"):
-            old = removed.get(pk)
-            if old:
-                try: Path(old).unlink(missing_ok=True)
-                except Exception: pass
+        old = removed.get("archive_path") or removed.get("path")
+        if old:
+            try:
+                Path(old).unlink(missing_ok=True)
+            except Exception:
+                pass
         try:
-            await client.edit_message_text(removed["chat_id"], removed["status_message_id"], "از صف حذف شد.")
+            await client.edit_message_text(
+                removed["chat_id"], removed["status_message_id"], "این مورد از صف حذف شد."
+            )
         except Exception:
             pass
         await message.reply_text("✅ از صف حذف شد.")
@@ -893,64 +768,7 @@ async def delete_one_handler(client: Client, message: Message):
         await message.reply_text("دستور لغو ثبت شد.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  هندلر رسید پرداخت (عکس)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.on_message(filters.private & filters.photo)
-async def photo_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    db.upsert_user(user_id, message.from_user.username or "",
-                   message.from_user.first_name or "", message.from_user.last_name or "")
-
-    # اگر در انتظار رسید هستیم
-    if user_id in awaiting_receipt:
-        order_id = awaiting_receipt[user_id]
-        photo_id = message.photo.file_id
-        order = db.get_order(order_id=order_id)
-        if not order or order["status"] != "pending":
-            awaiting_receipt.pop(user_id, None)
-            await message.reply_text("⚠️ سفارشی در انتظار یافت نشد.")
-            return
-
-        db.set_order_receipt(order_id, photo_id)
-        awaiting_receipt.pop(user_id, None)
-
-        await message.reply_text(
-            f"✅ **رسید ثبت شد!**\n\n"
-            f"سفارش #{order_id} در انتظار تأیید ادمین است.\n"
-            f"کد پیگیری: `{order['tx_code']}`\n\n"
-            f"معمولاً ظرف چند ساعت بررسی می‌شه. 🙏"
-        )
-
-        # اطلاع‌رسانی به ادمین
-        for admin_id in ADMIN_IDS:
-            try:
-                u = db.get_user(user_id)
-                name = u["first_name"] or str(user_id)
-                await client.send_photo(
-                    admin_id, photo_id,
-                    caption=(
-                        f"🔔 **رسید پرداخت جدید!**\n\n"
-                        f"#️⃣ سفارش: #{order_id}\n"
-                        f"👤 کاربر: {name} (`{user_id}`)\n"
-                        f"📋 پلن: {order['plan_name']}\n"
-                        f"💰 مبلغ: {order['amount']:,} تومان\n"
-                        f"🎫 کد: `{order['tx_code']}`\n\n"
-                        f"✅ `/approve {order_id}`\n"
-                        f"❌ `/reject {order_id} علت`"
-                    ),
-                )
-            except Exception:
-                pass
-        return
-
-    await message.reply_text("❓ عکسی دریافت شد اما نمی‌دانم چیکار کنم!\nبرای رسید پرداخت، ابتدا /buy را بزن.")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  هندلر متن (لینک / رمز ZIP)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────── پیام متنی ──────────────────────────────────────
 
 def extract_url(text: str) -> Optional[str]:
     m = re.search(r"https?://\S+", text or "")
@@ -959,121 +777,184 @@ def extract_url(text: str) -> Optional[str]:
 
 @app.on_message(
     filters.private & filters.text
-    & ~filters.command(["start","account","profile","sub","buy","safemode",
-                        "del","delall","addsub","delsub","orders","order",
-                        "approve","reject","stats","users","setcard","setholder","setsupport"])
+    & ~filters.command(["start", "profile", "sub", "admin",
+                        "del", "delall", "addsub", "delsub"])
 )
-async def text_handler(client: Client, message: Message):
-    user = message.from_user
-    db.upsert_user(user.id, user.username or "", user.first_name or "", user.last_name or "")
-    text = (message.text or "").strip()
+async def text_handler(_, message: Message):
+    user    = message.from_user
+    user_id = user.id
+    text    = message.text or ""
 
-    # رمز ZIP در انتظار
-    if awaiting_zip_pass.get(user.id):
-        if not text:
+    db.upsert_user(user_id, user.username or "", user.first_name or "", user.last_name or "")
+
+    # ── رمز ZIP
+    if waiting_for_zip_password.get(message.chat.id):
+        password = text.strip()
+        if not password:
             await message.reply_text("رمز نمی‌تواند خالی باشد.")
             return
-        db.update_safe_mode(user.id, True, text)
-        awaiting_zip_pass.pop(user.id, None)
-        await message.reply_text("✅ Safe Mode فعال شد و رمز ذخیره گردید.")
+        settings = load_settings()
+        settings["zip_password"] = password
+        save_settings(settings)
+        waiting_for_zip_password.pop(message.chat.id, None)
+        await message.reply_text("✅ رمز ذخیره شد. فایل‌ها با این رمز ZIP می‌شوند.")
         return
 
-    # لینک مستقیم
+    # ── ویرایش کارت ادمین
+    st = user_state.get(user_id, {})
+    if st.get("step") == "admin_edit_card" and user_id in ADMIN_IDS:
+        parts = text.split("|")
+        if len(parts) != 3:
+            await message.reply_text("فرمت نادرست. مثال:\n`6037-xxxx-xxxx-xxxx|نام|بانک`")
+            return
+        db.update_payment_settings(parts[0].strip(), parts[1].strip(), parts[2].strip())
+        user_state.pop(user_id, None)
+        await message.reply_text("✅ اطلاعات کارت به‌روزرسانی شد.")
+        return
+
+    # ── رسید پرداخت (از طریق متن؟ نه — فقط عکس؛ این بخش برای پیام عادی)
+    if st.get("step") == "waiting_receipt":
+        await message.reply_text("📸 لطفاً **عکس** رسید را بفرست (نه متن).")
+        return
+
+    # ── لینک مستقیم
     url = extract_url(text)
     if not url:
+        await message.reply_text(
+            "دستور نامعتبر. از منو استفاده کن:",
+            reply_markup=main_menu_kb(user_id),
+        )
         return
 
-    ok, reason = db.check_quota(user.id, 0)  # بررسی اینکه اصلاً سهمیه دارد
-    if not ok and "تمام" in reason:
-        await message.reply_text(reason, reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("💳 خرید اشتراک", callback_data="buy"),
-        ]]))
+    if not db.is_subscribed(user_id) and user_id not in ADMIN_IDS:
+        await message.reply_text(
+            "⛔ سهمیه شما تمام شده یا اشتراک ندارید.\n\n"
+            "برای خرید اشتراک از منو استفاده کن:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 خرید اشتراک", callback_data="menu_buy")]
+            ]),
+        )
         return
 
-    u = db.get_user(user.id)
-    status = await message.reply_text("🔗 لینک دریافت شد. در صف دانلود قرار گرفت...")
+    settings = load_settings()
+    status   = await message.reply_text("🔗 لینک دریافت شد. در صف دانلود قرار گرفت...")
     task = {
         "type":              "direct_url",
         "url":               url,
         "chat_id":           message.chat.id,
-        "telegram_user_id":  user.id,
+        "telegram_user_id":  user_id,
         "status_message_id": status.id,
-        "safe_mode":         bool(u.get("safe_mode")),
-        "zip_password":      u.get("zip_password", ""),
+        "safe_mode":         settings.get("safe_mode", False),
+        "zip_password":      settings.get("zip_password", ""),
     }
     queue.push(task)
     await status.edit_text(
-        f"🔗 **لینک در صف**\n\n"
+        f"🔗 **لینک در صف قرار گرفت**\n\n"
         f"شناسه: `{task['job_id']}`\n"
         f"برای حذف: `/del {task['job_id']}`"
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  هندلر مدیا (فایل‌ها)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────── دریافت رسید پرداخت (عکس/فایل) ─────────────────────
 
-@app.on_message(
-    filters.private &
-    (filters.document | filters.video | filters.audio | filters.voice |
-     filters.animation | filters.video_note | filters.sticker)
-)
-async def media_handler(client: Client, message: Message):
-    user = message.from_user
-    db.upsert_user(user.id, user.username or "", user.first_name or "", user.last_name or "")
+@app.on_message(filters.private & (filters.photo | filters.document))
+async def receipt_or_file_handler(client, message: Message):
+    user    = message.from_user
+    user_id = user.id
+    db.upsert_user(user_id, user.username or "", user.first_name or "", user.last_name or "")
+
+    st = user_state.get(user_id, {})
+
+    # ── رسید سفارش
+    if st.get("step") == "waiting_receipt":
+        order_id     = st["order_id"]
+        receipt_id   = (
+            message.photo.file_id if message.photo
+            else message.document.file_id
+        )
+        db.set_order_receipt(order_id, receipt_id)
+        user_state.pop(user_id, None)
+
+        await message.reply_text(
+            f"✅ رسید دریافت شد!\n\n"
+            f"🔑 کد سفارش: `{order_id}`\n"
+            f"⏳ در انتظار تایید ادمین...\n\n"
+            f"بعد از تایید، اشتراک شما فعال می‌شود."
+        )
+        # اطلاع‌رسانی به ادمین‌ها
+        order = db.get_order(order_id)
+        for admin_id in ADMIN_IDS:
+            try:
+                caption = (
+                    f"📋 **سفارش جدید #{order_id}**\n\n"
+                    f"👤 کاربر: `{user_id}` ({user.first_name})\n"
+                    f"💎 پلن: {order['plan_name']}\n"
+                    f"💰 مبلغ: {order['amount']:,} تومن\n"
+                    f"🔑 کد: `{order['tx_code']}`"
+                )
+                await client.send_photo(
+                    admin_id, receipt_id, caption=caption,
+                    reply_markup=order_action_kb(order_id),
+                )
+            except Exception:
+                pass
+        return
+
+    # ── فایل عادی برای انتقال
+    if not db.is_subscribed(user_id) and user_id not in ADMIN_IDS:
+        await message.reply_text(
+            "⛔ سهمیه شما تمام شده یا اشتراک ندارید.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 خرید اشتراک", callback_data="menu_buy")]
+            ]),
+        )
+        return
 
     media_type, media = get_media(message)
     if not media:
         await message.reply_text("فایل قابل پردازش نیست.")
         return
 
-    file_size = getattr(media, "file_size", 0) or 0
-    ok, reason = db.check_quota(user.id, file_size)
-    if not ok:
-        await message.reply_text(reason, reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("💳 خرید اشتراک", callback_data="buy"),
-        ]]))
+    # بررسی حجم فایل
+    file_size_check = getattr(media, "file_size", 0) or 0
+    if not db.has_quota(user_id, file_size_check) and user_id not in ADMIN_IDS:
+        await message.reply_text(
+            "⛔ سهمیه شما برای این فایل کافی نیست.\n\n"
+            "برای افزایش سهمیه اشتراک بخرید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 خرید اشتراک", callback_data="menu_buy")]
+            ]),
+        )
         return
 
     download_name = build_filename(message, media_type, media)
     download_path = DOWNLOAD_DIR / download_name
+    status_msg    = await message.reply_text("📥 آماده‌سازی برای دانلود از تلگرام...")
 
-    status = await message.reply_text("📥 آماده‌سازی برای دانلود از تلگرام...")
     try:
         started_at     = time.time()
         progress_state = {"last_update": 0}
+
         downloaded = await client.download_media(
             message,
             file_name=str(download_path),
             progress=download_progress,
-            progress_args=(status, download_name, started_at, progress_state),
+            progress_args=(status_msg, download_name, started_at, progress_state),
         )
-        if not downloaded:
+
+        if not downloaded or not Path(downloaded).exists():
             raise RuntimeError("دانلود ناموفق بود.")
-        dl_path = Path(downloaded)
-        if not dl_path.exists():
-            raise RuntimeError("فایل دانلود شده پیدا نشد.")
 
-        real_size = dl_path.stat().st_size
-        # بررسی مجدد با حجم واقعی
-        ok2, reason2 = db.check_quota(user.id, real_size)
-        if not ok2:
-            dl_path.unlink(missing_ok=True)
-            await status.edit_text(reason2)
-            return
+        dl_path   = Path(downloaded)
+        file_size = dl_path.stat().st_size
 
-        archive_path = DOWNLOAD_DIR / "archive" if False else ARCHIVE_DIR / download_name
+        archive_path = DOWNLOAD_DIR.parent / "archive" / download_name
         shutil.copy2(str(dl_path), str(archive_path))
 
-        unique_code = db.create_file_record(
-            telegram_user_id=user.id,
-            file_name=download_name,
-            file_size=real_size,
-            archive_path=str(archive_path),
-        )
-        db.add_bytes_used(user.id, real_size)
+        unique_code = db.create_file_record(user_id, download_name, file_size, str(archive_path))
+        db.add_bytes_used(user_id, file_size)
 
-        u = db.get_user(user.id)
+        settings = load_settings()
         task = {
             "type":              "local_file",
             "path":              str(dl_path),
@@ -1081,33 +962,30 @@ async def media_handler(client: Client, message: Message):
             "unique_code":       unique_code,
             "caption":           message.caption or "",
             "chat_id":           message.chat.id,
-            "telegram_user_id":  user.id,
-            "status_message_id": status.id,
+            "telegram_user_id":  user_id,
+            "status_message_id": status_msg.id,
             "file_name":         download_name,
-            "file_size":         real_size,
-            "safe_mode":         bool(u.get("safe_mode")),
-            "zip_password":      u.get("zip_password", ""),
+            "file_size":         file_size,
+            "safe_mode":         settings.get("safe_mode", False),
+            "zip_password":      settings.get("zip_password", ""),
         }
         queue.push(task)
 
-        remaining = max(0, u["bytes_quota"] - u["bytes_used"])
-        rub_username = db.get_setting("bot_username", "@YourRubikaBot")
-        await status.edit_text(
-            f"✅ **فایل در صف آپلود روبیکا**\n\n"
-            f"📄 `{download_name}`\n"
-            f"📦 {pretty_size(real_size)}\n"
-            f"🎫 کد: `{unique_code}`\n\n"
-            f"🤖 در ربات روبیکا ({rub_username}) این کد را وارد کن\n\n"
-            f"📊 سهمیه باقی: {pretty_size(remaining)}\n"
-            f"🆔 صف: `{task['job_id']}` | `/del {task['job_id']}`"
+        await status_msg.edit_text(
+            f"✅ **فایل در صف قرار گرفت**\n\n"
+            f"📄 فایل: `{download_name}`\n"
+            f"📦 حجم: `{pretty_size(file_size)}`\n"
+            f"🎫 **کد یونیک:** `{unique_code}`\n\n"
+            f"این کد را در **ربات روبیکا** بفرست تا فایل ارسال شود.\n\n"
+            f"🆔 شناسه صف: `{task['job_id']}`\n"
+            f"برای حذف: `/del {task['job_id']}`"
         )
+
     except Exception as e:
-        await status.edit_text(f"❌ خطا: {str(e)}")
+        await status_msg.edit_text(f"❌ خطا: {str(e)}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  اجرا
-# ═══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────── اجرا ─────────────────────────────────────────
 
 def clear_old_status():
     try:
