@@ -164,7 +164,7 @@ def init_db():
 def _migrate():
     """مهاجرت ساختار دیتابیس قدیمی"""
     with get_conn() as conn:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
         migrations = [
             ("bytes_quota",  "INTEGER", "209715200"),
             ("bytes_used",   "INTEGER", "0"),
@@ -176,7 +176,7 @@ def _migrate():
             if col not in cols:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} {typ} DEFAULT {defval}")
 
-        fwd_cols = {r[1] for r in conn.execute("PRAGMA table_info(forward_queue)")}
+        fwd_cols = {r["name"] for r in conn.execute("PRAGMA table_info(forward_queue)")}
         if "text_content" not in fwd_cols:
             conn.execute("ALTER TABLE forward_queue ADD COLUMN text_content TEXT")
         if "forward_type" not in fwd_cols:
