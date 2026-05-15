@@ -241,7 +241,7 @@ def _extract_update_fields(update) -> tuple:
 
 def run_with_botclient():
     try:
-        from rubpy.bot import BotClient, filters as bot_filters
+      from rubpy.bot import BotClient
     except ImportError as e:
         log.error(f"rubpy.bot import خطا: {e}")
         return False
@@ -249,7 +249,7 @@ def run_with_botclient():
     log.info("▶  شروع با rubpy BotClient...")
     app = BotClient(RUBIKA_BOT_TOKEN)
 
-    @app.on_update()
+    @app.on_message()
     async def on_all(client, update):
         """تمام آپدیت‌ها را می‌گیریم تا چیزی از دست نرود"""
         try:
@@ -266,8 +266,9 @@ def run_with_botclient():
 
             # ارسال پاسخ
             try:
-                await update.reply(reply_text)
-            except Exception:
+              await client.send_message(chat_id, reply_text)
+            except Exception as e:
+                
                 # اگر reply کار نکرد، از client مستقیم استفاده کن
                 try:
                     await client.send_message(chat_id, reply_text)
