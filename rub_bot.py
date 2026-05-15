@@ -305,22 +305,38 @@ _API_BASES = [
 
 
 def _api_call(method: str, payload: dict, timeout: int = 35) -> dict:
-    """فراخوانی API روبیکا با تلاش روی چند endpoint"""
     import requests
 
     for base in _API_BASES:
         url = f"{base}/{RUBIKA_BOT_TOKEN}/{method}"
+
         try:
             resp = requests.post(url, json=payload, timeout=timeout)
-            data = resp.json()
+
+            text = resp.text.strip()
+
+            # 🔥 چک مهم: اگر خالی بود
+            if not text:
+                log.warning(f"❌ پاسخ خالی از {base}")
+                continue
+
+            # 🔥 چک JSON بودن
+            try:
+                data = resp.json()
+            except Exception:
+                log.warning(f"❌ JSON نیست از {base}: {text[:100]}")
+                continue
+
             status = data.get("status") or data.get("status_det", "")
+
             if resp.status_code == 200 and status in ("OK", "ok", ""):
                 return data
+
         except requests.exceptions.RequestException as e:
             log.debug(f"endpoint {base} خطا: {e}")
             continue
-    return None
 
+    return None
 
 def _send_msg_polling(chat_id: str, text: str):
     result = _api_call("sendMessage", {"chat_id": chat_id, "text": text})
