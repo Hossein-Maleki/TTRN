@@ -3,5 +3,5 @@ tgcrypto==1.2.5
 rubpy==7.3.4
 rubika-bot==1.0.19
 python-dotenv==1.0.1
-requests==2.25.1
+requests==2.31.0
 pyzipper==0.3.6
